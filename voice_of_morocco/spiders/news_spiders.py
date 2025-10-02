@@ -1,188 +1,268 @@
 import scrapy
-from scrapy.spiders import SitemapSpider
-from urllib.parse import unquote, urlparse
-from voice_of_morocco.items import JaridaItem
 from datetime import datetime
+import logging
+import re
 
+class VoiceSpider(scrapy.Spider):
+    name = "voice"
+    allowed_domains = ["thevoice.ma"]
+    
+    # Start with page 1 (main category page)
+    start_urls = ["https://thevoice.ma/category/societe/"]
+    
+    # Configure settings
+    custom_settings = {
+        'USER_AGENT': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'FEED_FORMAT': 'json',
+        'FEED_URI': 'data/articles.json',
+        'FEED_EXPORT_ENCODING': 'utf-8',
+        'LOG_LEVEL': 'INFO',
+        'ROBOTSTXT_OBEY': False,
+        'CONCURRENT_REQUESTS': 1,
+        'DOWNLOAD_DELAY': 2,
+    }
 
-class NewsSpider(SitemapSpider):
-    name = "voice_news"
-    allowed_domains = ["thevoice.ma", "www.thevoice.ma"]
-
-    # Use Yoast sitemap to discover all posts
-    sitemap_urls = [
-        "https://thevoice.ma/sitemap_index.xml",
-    ]
-    # Follow main post sitemap and additional custom content sitemaps
-    sitemap_follow = [
-        r"post-sitemap\d*\.xml",
-        r"thevoice_video-sitemap\.xml",
-        r"thevoice_podcast-sitemap\.xml",
-        r"thevoice_magazine-sitemap\.xml",
-        r"thevoice_story-sitemap\d*\.xml",
-    ]
-    # Parse every URL in matched sitemaps
-    sitemap_rules = [
-        (r".*", "parse_article"),
-    ]
-
-    def __init__(self, from_date: str | None = None, to_date: str | None = None, *args, **kwargs):
-        """
-        Optional date filtering (ISO 8601, e.g. 2025-09-21). If not provided, no date filter.
-        Example:
-          scrapy crawl voice_news -a from_date=2025-09-21 -a to_date=2025-09-28
-        """
-        super().__init__(*args, **kwargs)
-        self.from_date = None
-        self.to_date = None
-        if from_date:
-            try:
-                # Make date timezone-naive for comparison
-                self.from_date = datetime.fromisoformat(from_date).replace(tzinfo=None)
-                self.logger.info(f"Filtering from date: {self.from_date}")
-            except Exception as e:
-                self.logger.warning(f"Invalid from_date: {from_date}, error: {e}")
-        if to_date:
-            try:
-                # Add end of day and make timezone-naive
-                self.to_date = datetime.fromisoformat(to_date).replace(hour=23, minute=59, second=59, tzinfo=None)
-                self.logger.info(f"Filtering to date: {self.to_date}")
-            except Exception as e:
-                self.logger.warning(f"Invalid to_date: {to_date}, error: {e}")
-
-    def sitemap_filter(self, entries):
-        """Filter entries at sitemap level to avoid downloading unwanted pages."""
-        # If no date filters, yield all entries
-        if not self.from_date and not self.to_date:
-            for entry in entries:
-                yield entry
-            return
+    def __init__(self, *args, **kwargs):
+        super(VoiceSpider, self).__init__(*args, **kwargs)
+        # Target date range: from September 21st until today
+        self.start_date = datetime(2025, 9, 21).date()
+        self.end_date = datetime.now().date()
+        self.stop_date = datetime(2025, 9, 20).date()  # Stop when we reach September 20th
         
-        filtered_count = 0
-        passed_count = 0
+        # Arabic month mappings
+        self.arabic_months = {
+            'يناير': 1, 'فبراير': 2, 'مارس': 3, 'أبريل': 4, 'ماي': 5, 'مايو': 5,
+            'يونيو': 6, 'يوليو': 7, 'غشت': 8, 'أغسطس': 8, 'شتنبر': 9, 'سبتمبر': 9,
+            'أكتوبر': 10, 'نونبر': 11, 'نوفمبر': 11, 'دجنبر': 12, 'ديسمبر': 12
+        }
         
-        for entry in entries:
-            # Skip if no lastmod (can't filter, so skip to be safe when filtering is active)
-            if 'lastmod' not in entry:
-                self.logger.debug(f"No lastmod for {entry.get('loc', 'unknown')}, skipping")
-                filtered_count += 1
-                continue
+        self.articles_found = 0
+        self.should_stop = False
+
+    def parse_arabic_date(self, date_text):
+        """Parse Arabic date format like 'الأحد 28 سبتمبر 2025 - 18:58'"""
+        if not date_text:
+            return None
             
-            try:
-                # Parse sitemap date - handle different formats
-                lastmod = entry['lastmod']
-                # Remove timezone indicator and parse as naive datetime
-                if lastmod.endswith('Z'):
-                    lastmod = lastmod[:-1]  # Remove Z
+        try:
+            # Remove day name and time part
+            date_part = date_text.split(' - ')[0].strip()
+            
+            # Extract day, month, year using regex
+            match = re.search(r'(\d{1,2})\s+([^\d\s]+)\s+(\d{4})', date_part)
+            if match:
+                day = int(match.group(1))
+                month_arabic = match.group(2)
+                year = int(match.group(3))
                 
-                # Parse and remove timezone info for comparison
-                if '+' in lastmod:
-                    entry_date = datetime.fromisoformat(lastmod).replace(tzinfo=None)
-                else:
-                    entry_date = datetime.fromisoformat(lastmod)
-                
-                # Apply date filters
-                if self.from_date and entry_date < self.from_date:
-                    filtered_count += 1
-                    continue
-                if self.to_date and entry_date > self.to_date:
-                    filtered_count += 1
-                    continue
+                # Convert Arabic month to number
+                month = self.arabic_months.get(month_arabic)
+                if month:
+                    return datetime(year, month, day).date()
                     
-                passed_count += 1
-                yield entry
-                
-            except Exception as e:
-                # If date parsing fails, skip entry when filtering is active
-                self.logger.debug(f"Could not parse date {entry.get('lastmod', 'N/A')}: {e}, skipping")
-                filtered_count += 1
-                continue
+        except Exception as e:
+            self.logger.warning(f"Could not parse date '{date_text}': {e}")
+            
+        return None
+
+    def is_within_date_range(self, date_text):
+        """Check if date is within our target range (Sept 21 to today)"""
+        parsed_date = self.parse_arabic_date(date_text)
+        if parsed_date:
+            # Check if we reached September 20th (stop condition)
+            if parsed_date <= self.stop_date:
+                self.should_stop = True
+                self.logger.info(f"🛑 Reached stop date: {parsed_date}. Stopping crawl.")
+                return False
+            
+            # Check if date is within our target range (Sept 21 to today)
+            return self.start_date <= parsed_date <= self.end_date
+        return False
+
+    def extract_arabic_author(self, response):
+        """
+        Extract Arabic author name from the author box structure
+        Based on the HTML structure you provided
+        """
+        # Method 1: Try to extract from author-name span (direct text)
+        author_name = response.css('span.author-name a::text').get()
+        if author_name and author_name.strip():
+            return author_name.strip()
         
-        # Log filtering results
-        self.logger.info(f"Sitemap filtering: {passed_count} entries passed, {filtered_count} filtered out")
+        # Method 2: Try to extract from the author box content
+        author_name = response.css('.author-box .author-name::text').get()
+        if author_name and author_name.strip():
+            return author_name.strip()
+        
+        # Method 3: Try to extract from the author data section
+        author_name = response.css('.author-data .author-name::text').get()
+        if author_name and author_name.strip():
+            return author_name.strip()
+        
+        # Method 4: Try to extract from any author-related elements with more specific selectors
+        author_selectors = [
+            '.author-box-content .author-name a::text',
+            '.author-box .author-data .author-name a::text',
+            'span.author-name::text',
+            '.post-author a::text',
+            'a[rel="author"]::text',
+            'span.byline a::text',
+            'div.author a::text'
+        ]
+        
+        for selector in author_selectors:
+            author_name = response.css(selector).get()
+            if author_name and author_name.strip():
+                return author_name.strip()
+        
+        # Method 5: If all else fails, try to extract from meta tags
+        author_name = response.css('meta[name="author"]::attr(content)').get()
+        if author_name and author_name.strip():
+            return author_name.strip()
+            
+        self.logger.warning(f"Could not extract author name from: {response.url}")
+        return ""
+
+    def parse(self, response):
+        """
+        Parse the category page: extract article links and pagination.
+        """
+        # Check if we should stop crawling
+        if self.should_stop:
+            self.logger.info("🛑 Stop condition met. Ending crawl.")
+            return
+            
+        self.logger.info(f'Parsing category page: {response.url}')
+        
+        # Try multiple selectors to find article links
+        article_selectors = [
+            'h2.entry-title a::attr(href)',
+            'h2.title a::attr(href)',
+            'h2 a::attr(href)',
+            'a.entry-title-link::attr(href)',
+            'article a:has(img)::attr(href)',
+            'div.post-item a::attr(href)'
+        ]
+        
+        article_links = []
+        for selector in article_selectors:
+            links = response.css(selector).getall()
+            if links:
+                article_links = links
+                self.logger.info(f'Found {len(links)} articles using selector: {selector}')
+                break
+        
+        if not article_links:
+            self.logger.warning('No article links found on page.')
+            
+        # Follow article links
+        for link in article_links:
+            if '/category/' not in link and not self.should_stop:  # Skip category links
+                yield response.follow(link, callback=self.parse_article)
+                
+        # Handle pagination only if we haven't reached stop condition
+        if not self.should_stop:
+            next_selectors = [
+                'a.next::attr(href)',
+                'a.next.page-numbers::attr(href)',
+                'li.pagination-next a::attr(href)',
+                'a[rel="next"]::attr(href)'
+            ]
+            
+            next_page = None
+            for selector in next_selectors:
+                next_page = response.css(selector).get()
+                if next_page:
+                    self.logger.info(f'Found next page: {next_page}')
+                    yield response.follow(next_page, callback=self.parse)
+                    break
 
     def parse_article(self, response):
-        """Parse an individual article page on thevoice.ma (WordPress)."""
-        
-        # Get page date
-        date_str = (
-            response.css("meta[property='article:published_time']::attr(content)").get()
-            or response.css("time[datetime]::attr(datetime)").get()
-            or response.css("meta[name='article:published_time']::attr(content)").get()
-        )
-        
-        # Double-check date filtering at page level (backup filter)
-        if self.from_date or self.to_date:
-            if not date_str:
-                self.logger.debug(f"Skipping {response.url} - no date found")
-                return
+        """
+        Parse an article page and extract required info.
+        """
+        # Check if we should stop processing
+        if self.should_stop:
+            return
             
-            try:
-                # Parse date and remove timezone info
-                pub_date_str = date_str
-                if pub_date_str.endswith('Z'):
-                    pub_date_str = pub_date_str[:-1]  # Remove Z
-                
-                if '+' in pub_date_str:
-                    pub_dt = datetime.fromisoformat(pub_date_str).replace(tzinfo=None)
-                else:
-                    pub_dt = datetime.fromisoformat(pub_date_str)
-                
-                if self.from_date and pub_dt < self.from_date:
-                    self.logger.debug(f"Skipping {response.url} - date {pub_dt.date()} before from_date {self.from_date.date()}")
-                    return
-                if self.to_date and pub_dt > self.to_date:
-                    self.logger.debug(f"Skipping {response.url} - date {pub_dt.date()} after to_date {self.to_date.date()}")
-                    return
-            except Exception as e:
-                self.logger.warning(f"Could not parse page date {date_str}: {e}, skipping")
-                return
+        self.logger.info(f'Parsing article: {response.url}')
         
-        # ... rest of your parse_article method remains the same
-        item = JaridaItem()
-
-        # Stable id from slug
-        try:
-            slug = urlparse(response.url).path.rstrip("/").split("/")[-1]
-            item["idPost"] = unquote(slug)
-        except Exception:
-            item["idPost"] = response.url
-
-        # Title (prefer on-page h1, fallback to OG title, then <title>)
-        title = response.css("h1.entry-title::text").get()
-        if not title:
-            title = response.css("meta[property='og:title']::attr(content)").get()
-        if not title:
-            title = response.css("title::text").get()
-        item["title"] = title
-
-        # Published date (ISO if available)
-        item["date"] = date_str
-
-        # Article text
-        paragraphs = response.css(
-            "article .entry-content p::text, .entry-content p::text, article p::text"
-        ).getall()
-        item["text"] = " ".join([t.strip() for t in paragraphs if t and t.strip()])
-
-        # Media
-        images = response.css(
-            "article img::attr(src), .entry-content img::attr(src)"
-        ).getall()
-        item["images"] = [response.urljoin(u) for u in images]
-        videos = response.css(
-            "article video::attr(src), article video source::attr(src), article iframe::attr(src), "
-            ".entry-content video::attr(src), .entry-content iframe::attr(src)"
-        ).getall()
-        item["videos"] = [response.urljoin(u) for u in videos]
-
-        # Links inside article
-        links = response.css(
-            "article .entry-content a::attr(href), article a::attr(href), .entry-content a::attr(href)"
-        ).getall()
-        item["links"] = [response.urljoin(u) for u in links]
-
-        # Page URL
-        item["url"] = response.url
-
+        # Extract date first to check if it's in our range
+        date_selectors = [
+            'time.entry-date::text',
+            'time.item-date::text',
+            'span.date::text',
+            'div.date::text',
+            '.post-date::text',
+            '.article-date::text',
+            'meta[property="article:published_time"]::attr(content)'
+        ]
+        
+        date_text = ''
+        for selector in date_selectors:
+            date_element = response.css(selector).get()
+            if date_element:
+                date_text = date_element.strip()
+                self.logger.info(f'Found date: {date_text}')
+                break
+        
+        # Check if article is within our date range
+        if not self.is_within_date_range(date_text):
+            self.logger.info(f'Skipping article - date outside range: {date_text}')
+            return
+        
+        self.logger.info(f'✅ Article within target range: {date_text}')
+        
+        # Extract other fields
+        def get_text(selectors):
+            for selector in selectors:
+                element = response.css(selector).get()
+                if element:
+                    return element.strip()
+            return ''
+            
+        def get_list(selectors):
+            for selector in selectors:
+                elements = response.css(selector).getall()
+                if elements:
+                    return [e.strip() for e in elements if e.strip()]
+            return []
+        
+        # Extract Arabic author name using the new method
+        arabic_author = self.extract_arabic_author(response)
+        self.logger.info(f'Extracted author: {arabic_author}')
+        
+        # Only include the fields we want
+        item = {
+            'url': response.url,
+            'title': get_text([
+                'h1.entry-title::text',
+                'h1.title::text',
+                'h1::text',
+                'header h1::text',
+                'h1.article-title::text'
+            ]),
+            'date': date_text,
+            'author': arabic_author,  # Use the extracted Arabic author name
+            'content': ' '.join(response.css(', '.join([
+                'div.entry-content p::text',
+                'div#item-content p::text',
+                'div.post-content p::text',
+                'article p::text',
+                'div.content p::text'
+            ])).getall()).strip(),
+            'images': response.css(', '.join([
+                'div.entry-content img::attr(src)',
+                'img.wp-post-image::attr(src)',
+                'figure img::attr(src)',
+                'div.article-image img::attr(src)',
+                'article img::attr(src)'
+            ])).getall(),
+            'links': response.css('div.entry-content a::attr(href)').getall(),
+        }
+        
+        self.articles_found += 1
+        self.logger.info(f'✅ Extracted article #{self.articles_found}: {item["title"][:50]}...')
+        self.logger.info(f'✅ Author: {arabic_author}')
+        
         yield item
