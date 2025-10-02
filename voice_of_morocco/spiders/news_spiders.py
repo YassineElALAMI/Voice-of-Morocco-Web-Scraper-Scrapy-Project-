@@ -38,6 +38,8 @@ class VoiceSpider(scrapy.Spider):
         
         self.articles_found = 0
         self.should_stop = False
+        self.current_page = 1
+        self.article_links_queue = []
 
     def parse_arabic_date(self, date_text):
         """Parse Arabic date format like 'الأحد 28 سبتمبر 2025 - 18:58'"""
@@ -132,7 +134,7 @@ class VoiceSpider(scrapy.Spider):
             self.logger.info("🛑 Stop condition met. Ending crawl.")
             return
             
-        self.logger.info(f'Parsing category page: {response.url}')
+        self.logger.info(f'📄 Parsing category page {self.current_page}: {response.url}')
         
         # Try multiple selectors to find article links
         article_selectors = [
@@ -149,33 +151,65 @@ class VoiceSpider(scrapy.Spider):
             links = response.css(selector).getall()
             if links:
                 article_links = links
-                self.logger.info(f'Found {len(links)} articles using selector: {selector}')
+                self.logger.info(f'🔗 Found {len(links)} articles using selector: {selector}')
                 break
         
         if not article_links:
-            self.logger.warning('No article links found on page.')
+            self.logger.warning('❌ No article links found on page.')
+            return
             
-        # Follow article links
-        for link in article_links:
-            if '/category/' not in link and not self.should_stop:  # Skip category links
-                yield response.follow(link, callback=self.parse_article)
-                
-        # Handle pagination only if we haven't reached stop condition
-        if not self.should_stop:
-            next_selectors = [
-                'a.next::attr(href)',
-                'a.next.page-numbers::attr(href)',
-                'li.pagination-next a::attr(href)',
-                'a[rel="next"]::attr(href)'
-            ]
+        # Process articles one by one using the queue approach
+        self.article_links_queue = article_links.copy()
+        self.logger.info(f'🔄 Processing {len(article_links)} articles from latest to oldest...')
+        
+        # Start processing the first article
+        yield from self.process_next_article(response)
+
+    def process_next_article(self, response):
+        """Process articles one by one from the queue"""
+        if self.should_stop or not self.article_links_queue:
+            # All articles processed, now handle pagination
+            yield from self.handle_pagination(response)
+            return
             
-            next_page = None
-            for selector in next_selectors:
-                next_page = response.css(selector).get()
-                if next_page:
-                    self.logger.info(f'Found next page: {next_page}')
-                    yield response.follow(next_page, callback=self.parse)
-                    break
+        # Get the next article link
+        link = self.article_links_queue.pop(0)
+        
+        if '/category/' not in link:  # Skip category links
+            remaining = len(self.article_links_queue)
+            self.logger.info(f'➡️ Following article ({remaining + 1} remaining): {link}')
+            
+            yield response.follow(
+                link, 
+                callback=self.parse_article,
+                meta={
+                    'remaining_articles': remaining,
+                    'original_response': response
+                }
+            )
+
+    def handle_pagination(self, response):
+        """Handle pagination after all articles are processed"""
+        if self.should_stop:
+            return
+            
+        next_selectors = [
+            'a.next.page-numbers::attr(href)',  # This matches your button
+            'a.next::attr(href)',
+            'li.pagination-next a::attr(href)',
+            'a[rel="next"]::attr(href)'
+        ]
+        
+        next_page = None
+        for selector in next_selectors:
+            next_page = response.css(selector).get()
+            if next_page:
+                self.current_page += 1
+                self.logger.info(f'⏭️ Moving to page {self.current_page}: {next_page}')
+                yield response.follow(next_page, callback=self.parse)
+                break
+        else:
+            self.logger.info('✅ No more pages found. Crawling completed.')
 
     def parse_article(self, response):
         """
@@ -185,7 +219,7 @@ class VoiceSpider(scrapy.Spider):
         if self.should_stop:
             return
             
-        self.logger.info(f'Parsing article: {response.url}')
+        self.logger.info(f'📖 Parsing article: {response.url}')
         
         # Extract date first to check if it's in our range
         date_selectors = [
@@ -203,66 +237,68 @@ class VoiceSpider(scrapy.Spider):
             date_element = response.css(selector).get()
             if date_element:
                 date_text = date_element.strip()
-                self.logger.info(f'Found date: {date_text}')
+                self.logger.info(f'📅 Found date: {date_text}')
                 break
         
         # Check if article is within our date range
         if not self.is_within_date_range(date_text):
-            self.logger.info(f'Skipping article - date outside range: {date_text}')
-            return
-        
-        self.logger.info(f'✅ Article within target range: {date_text}')
-        
-        # Extract other fields
-        def get_text(selectors):
-            for selector in selectors:
-                element = response.css(selector).get()
-                if element:
-                    return element.strip()
-            return ''
+            self.logger.info(f'⏩ Skipping article - date outside range: {date_text}')
+        else:
+            self.logger.info(f'✅ Article within target range: {date_text}')
             
-        def get_list(selectors):
-            for selector in selectors:
-                elements = response.css(selector).getall()
-                if elements:
-                    return [e.strip() for e in elements if e.strip()]
-            return []
-        
-        # Extract Arabic author name using the new method
-        arabic_author = self.extract_arabic_author(response)
-        self.logger.info(f'Extracted author: {arabic_author}')
-        
-        # Only include the fields we want
-        item = {
-            'url': response.url,
-            'title': get_text([
-                'h1.entry-title::text',
-                'h1.title::text',
-                'h1::text',
-                'header h1::text',
-                'h1.article-title::text'
-            ]),
-            'date': date_text,
-            'author': arabic_author,  # Use the extracted Arabic author name
-            'content': ' '.join(response.css(', '.join([
-                'div.entry-content p::text',
-                'div#item-content p::text',
-                'div.post-content p::text',
-                'article p::text',
-                'div.content p::text'
-            ])).getall()).strip(),
-            'images': response.css(', '.join([
-                'div.entry-content img::attr(src)',
-                'img.wp-post-image::attr(src)',
-                'figure img::attr(src)',
-                'div.article-image img::attr(src)',
-                'article img::attr(src)'
-            ])).getall(),
-            'links': response.css('div.entry-content a::attr(href)').getall(),
-        }
-        
-        self.articles_found += 1
-        self.logger.info(f'✅ Extracted article #{self.articles_found}: {item["title"][:50]}...')
-        self.logger.info(f'✅ Author: {arabic_author}')
-        
-        yield item
+            # Extract other fields
+            def get_text(selectors):
+                for selector in selectors:
+                    element = response.css(selector).get()
+                    if element:
+                        return element.strip()
+                return ''
+                
+            def get_list(selectors):
+                for selector in selectors:
+                    elements = response.css(selector).getall()
+                    if elements:
+                        return [e.strip() for e in elements if e.strip()]
+                return []
+            
+            # Extract Arabic author name using the new method
+            arabic_author = self.extract_arabic_author(response)
+            self.logger.info(f'✍️ Extracted author: {arabic_author}')
+            
+            # Only include the fields we want
+            item = {
+                'url': response.url,
+                'title': get_text([
+                    'h1.entry-title::text',
+                    'h1.title::text',
+                    'h1::text',
+                    'header h1::text',
+                    'h1.article-title::text'
+                ]),
+                'date': date_text,
+                'author': arabic_author,  # Use the extracted Arabic author name
+                'content': ' '.join(response.css(', '.join([
+                    'div.entry-content p::text',
+                    'div#item-content p::text',
+                    'div.post-content p::text',
+                    'article p::text',
+                    'div.content p::text'
+                ])).getall()).strip(),
+                'images': response.css(', '.join([
+                    'div.entry-content img::attr(src)',
+                    'img.wp-post-image::attr(src)',
+                    'figure img::attr(src)',
+                    'div.article-image img::attr(src)',
+                    'article img::attr(src)'
+                ])).getall(),
+                'links': response.css('div.entry-content a::attr(href)').getall(),
+            }
+            
+            self.articles_found += 1
+            self.logger.info(f'✅ Extracted article #{self.articles_found}: {item["title"][:50]}...')
+            self.logger.info(f'✅ Author: {arabic_author}')
+            
+            yield item
+
+        # Process the next article in the queue
+        yield from self.process_next_article(response.meta['original_response'])

@@ -21,9 +21,11 @@ class JaridaItem(scrapy.Item):
 # Optional: a simpler item used by other spiders (keeps backward compatibility)
 class VoiceItem(scrapy.Item):
     url = scrapy.Field()
-    date = scrapy.Field()
     title = scrapy.Field()
-    image = scrapy.Field()
+    date = scrapy.Field()
+    author = scrapy.Field()
     content = scrapy.Field()
+    images = scrapy.Field()
+    links = scrapy.Field()
 
 __all__ = ["JaridaItem", "VoiceItem"]
